@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 cleanup() {
-  rm -rf $tmp_dir
+  rm -rf "$tmp_dir"
 }
 
 on_error() {
@@ -12,6 +12,34 @@ on_error() {
 
 trap 'on_error $LINENO' ERR
 
+include_worktrees=false
+
+usage() {
+  cat <<'EOF'
+Usage: git-housekeeping [--include-worktrees]
+
+By default, branches checked out in a Git worktree are excluded from cleanup.
+--include-worktrees makes them available for selection; deleting one also
+forcibly removes its worktree and directory.
+EOF
+}
+
+case "${1:-}" in
+  '')
+    ;;
+  --include-worktrees)
+    include_worktrees=true
+    ;;
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  *)
+    usage >&2
+    exit 1
+    ;;
+esac
+
 if !(git rev-parse --is-inside-work-tree >& /dev/null); then
     echo "Not inside a git repository, aborting"
     exit 1
@@ -21,23 +49,89 @@ tmp_dir=$(mktemp -d -t git-housekeeping-XXXXX)
 remotes=$tmp_dir/remotes
 locals=$tmp_dir/locals
 branchesToDelete=$tmp_dir/branchesToDelete
+branchesInWorktrees=$tmp_dir/branchesInWorktrees
+protectedWorktreeBranches=$tmp_dir/protectedWorktreeBranches
+
+worktree_path_for_branch() {
+    git worktree list --porcelain | awk -v branch="refs/heads/$1" '
+        $1 == "worktree" { path = substr($0, 10) }
+        $1 == "branch" && substr($0, 8) == branch { print path; exit }
+    '
+}
+
+main_worktree_path() {
+    git worktree list --porcelain | awk '
+        $1 == "worktree" { print substr($0, 10); exit }
+    '
+}
+
+current_worktree_path="$(git rev-parse --show-toplevel)"
+primary_worktree_path="$(main_worktree_path)"
+
+worktree_is_protected() {
+    [ "$1" = "$current_worktree_path" ] || [ "$1" = "$primary_worktree_path" ]
+}
 
 git remote prune origin
 
-git branch -r --format "%(refname:lstrip=3)" > $remotes
-git branch --format "%(refname:lstrip=2)" > $locals
-cat $locals | grep -xv -f $remotes > $branchesToDelete || true
+git branch -r --format "%(refname:lstrip=3)" > "$remotes"
+git branch --format "%(refname:lstrip=2)" > "$locals"
+grep -xv -f "$remotes" "$locals" > "$branchesToDelete" || true
+
+if [ "$include_worktrees" = false ]; then
+    : > "$branchesInWorktrees"
+    while IFS= read -r branch; do
+        if [ -n "$(worktree_path_for_branch "$branch")" ]; then
+            printf '%s\n' "$branch" >> "$branchesInWorktrees"
+        fi
+    done < "$branchesToDelete"
+    grep -xv -f "$branchesInWorktrees" "$branchesToDelete" > "$branchesToDelete.filtered" || true
+    mv "$branchesToDelete.filtered" "$branchesToDelete"
+
+    if [ -s "$branchesInWorktrees" ]; then
+        echo "Skipping $(wc -l < "$branchesInWorktrees") branches checked out in worktrees (use --include-worktrees to include them)"
+    fi
+else
+    : > "$protectedWorktreeBranches"
+    while IFS= read -r branch; do
+        worktree_path="$(worktree_path_for_branch "$branch")"
+        if [ -n "$worktree_path" ] && worktree_is_protected "$worktree_path"; then
+            printf '%s\n' "$branch" >> "$protectedWorktreeBranches"
+        fi
+    done < "$branchesToDelete"
+    grep -xv -f "$protectedWorktreeBranches" "$branchesToDelete" > "$branchesToDelete.filtered" || true
+    mv "$branchesToDelete.filtered" "$branchesToDelete"
+
+    if [ -s "$protectedWorktreeBranches" ]; then
+        echo "Skipping $(wc -l < "$protectedWorktreeBranches") branches checked out in this or the primary worktree"
+    fi
+fi
 
 # -w checks word counts to ignore blank lines
-if [ $(wc -w < $branchesToDelete) -gt 0 ];
+if [ $(wc -w < "$branchesToDelete") -gt 0 ];
 then
-    echo "$(wc -l < $branchesToDelete) branches without matching remote found, outputting to editor"
+    echo "$(wc -l < "$branchesToDelete") branches without matching remote found, outputting to editor"
     echo "Waiting for editor to close"
-    $VISUAL $branchesToDelete
-    for branch in `cat $branchesToDelete`;
-    do
-        git branch -D $branch
-    done
+    "${VISUAL:-vi}" "$branchesToDelete"
+    while IFS= read -r branch; do
+        [ -n "$branch" ] || continue
+        worktree_path="$(worktree_path_for_branch "$branch")"
+
+        if [ -n "$worktree_path" ]; then
+            if worktree_is_protected "$worktree_path"; then
+                echo "Skipping '$branch': it is checked out in this or the primary worktree"
+                continue
+            fi
+            if [ "$include_worktrees" = false ]; then
+                echo "Skipping '$branch': it is now checked out in worktree '$worktree_path'"
+                continue
+            fi
+            echo "Removing worktree '$worktree_path' for branch '$branch'"
+            git worktree remove --force "$worktree_path"
+        fi
+
+        git branch -D -- "$branch"
+    done < "$branchesToDelete"
 else
     echo "There are no branches to cleanup.";
 fi
